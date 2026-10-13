@@ -15,7 +15,7 @@ def test_get_db_path_missing_raises(monkeypatch):
 def test_connect_is_read_only(mela_db):
     conn = db.connect()
     assert conn.execute("SELECT count(*) FROM ZRECIPEOBJECT").fetchone()[0] == 3
-    with pytest.raises(sqlite3.OperationalError):
+    with pytest.raises(sqlite3.DatabaseError):
         conn.execute("INSERT INTO ZRECIPETAG (Z_PK, ZTITLE) VALUES (99, 'x')")
 
 def test_list_tags_counts(mela_db):

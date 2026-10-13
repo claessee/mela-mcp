@@ -1,16 +1,17 @@
 # mela-mcp
 
 An unofficial, read-only MCP server that exposes recipes from the Mela macOS app
-(`search_recipes`, `get_recipe`, `list_tags`) to MCP-compatible assistants.
+to MCP-compatible assistants. See README.md for the seven structured tools.
 
 ## Conventions
 
-- All SQL and schema knowledge lives in `mela_mcp/db.py`; `mela_mcp/server.py` only
-  wraps those helpers as MCP tools — don't put SQL in server.py.
-- Read-only forever — never add write queries against Curcuma.sqlite; future writes
-  must go through Mela's own import surface (`mela://` URLs, `.melarecipe` files, or
-  Shortcuts/App Intents), never direct DB writes (it's a CloudKit-synced Core Data
-  store).
+- Schema assumptions live in `schema.py`, queries in `db.py`, discovery in
+  `discovery.py`, optional blob decoding in `images.py`. No SQL in server.py.
+- Mela is strictly read-only. Source DB/WAL files are copied with stability
+  checks into an owned temporary snapshot; SQLite never opens the Mela source.
+- Future meal history, plans, pantry and inventory must live in system-owned
+  files/databases. Do not add any Mela import or write surface.
 - Requires `mcp>=2.0` (`MCPServer`); the older `FastMCP` API is gone.
 - Run tests with `python -m pytest`. The live test (`tests/test_live.py`) needs Mela
-  installed and skips otherwise.
+  installed; explicitly enable with MELA_LIVE_TEST=1. Missing live storage must
+  be reported as a verification limitation, never as a fixture-based success.

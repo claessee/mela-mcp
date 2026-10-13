@@ -1,6 +1,6 @@
 [project]
 name = "mela-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Unofficial read-only MCP connector for the Mela recipe app (macOS)."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,6 +12,7 @@ dev = ["pytest>=8.0"]
 
 [project.scripts]
 mela-mcp = "mela_mcp.server:main"
+mela-mcp-doctor = "mela_mcp.diagnostics:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -22,3 +23,5 @@ packages = ["mela_mcp"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "mela_mcp/widgets/recipe.html" = "mela_mcp/widgets/recipe.html"
+"licenses/mela-cli-MIT.txt" = "mela_mcp/licenses/mela-cli-MIT.txt"
+"THIRD_PARTY_NOTICES.md" = "mela_mcp/THIRD_PARTY_NOTICES.md"

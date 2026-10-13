@@ -1,198 +1,254 @@
-import os
-import re
+"""Read-only Mela catalog API. No MCP imports, source writes, or planning state."""
+from __future__ import annotations
+
+import math
 import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
 
-_UUID_RE = re.compile(r"^[0-9A-Fa-f-]{36}$")
+from .discovery import discover_mela
+from .errors import MelaError
+from .schema import FIELDS, SEARCH_FIELDS, Schema, inspect_schema, quote_identifier
+from .snapshot import copy_snapshot
 
-MAX_IMAGE_BYTES = 25 * 1024 * 1024  # 25 MB
+MAX_IMAGE_BYTES = 25 * 1024 * 1024
+MAX_PAGE_SIZE = 100
+DEFAULT_DB_PATH = "~/Library/Group Containers/66JC38RDUD.recipes.mela/Data/Curcuma.sqlite"
 
-DEFAULT_DB_PATH = (
-    "~/Library/Group Containers/66JC38RDUD.recipes.mela/Data/Curcuma.sqlite"
-)
+
+class Connection(sqlite3.Connection):
+    schema: Schema
+
+    def close(self) -> None:
+        try:
+            super().close()
+        finally:
+            directory = getattr(self, "snapshot_directory", None)
+            if directory is not None:
+                directory.cleanup()
+                self.snapshot_directory = None
+
 
 def get_db_path() -> str:
-    override = os.environ.get("MELA_DB_PATH")
-    path = override if override else os.path.expanduser(DEFAULT_DB_PATH)
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"Mela database not found at '{path}'. Set MELA_DB_PATH to override, "
-            "or make sure the Mela app is installed and has synced recipes."
-        )
-    return path
+    discovery = discover_mela()
+    if discovery.errors:
+        error = discovery.errors[0]
+        raise MelaError(error["code"], error["message"], discovery=discovery.to_dict())
+    if discovery.db_path is None:
+        raise FileNotFoundError("Mela database not found. Set MELA_DB_PATH or install Mela and sync recipes locally.")
+    try:
+        discovery.db_path.stat()  # Preserve access errors instead of disguising them as missing files.
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"Mela database not found at '{discovery.db_path}'. Set MELA_DB_PATH or sync Mela locally.") from exc
+    return str(discovery.db_path)
 
-def connect(path: str | None = None) -> sqlite3.Connection:
-    path = path or get_db_path()
+
+def _authorize(action, arg1, arg2, database, trigger):
+    if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION,
+                  sqlite3.SQLITE_TRANSACTION, sqlite3.SQLITE_RECURSIVE):
+        return sqlite3.SQLITE_OK
+    if action == sqlite3.SQLITE_PRAGMA and (
+        (arg1 == "table_info") or
+        (arg1 in {"query_only", "database_list", "schema_version", "user_version", "quick_check"} and arg2 is None)
+    ):
+        return sqlite3.SQLITE_OK
+    return sqlite3.SQLITE_DENY
+
+
+def connect(path: str | Path | None = None) -> Connection:
+    source = Path(path if path is not None else get_db_path()).expanduser().resolve()
+    directory, snapshot = copy_snapshot(source)
     conn = None
-    for params in ("mode=ro", "immutable=1"):
-        try:
-            conn = sqlite3.connect(f"file:{path}?{params}", uri=True)
-            conn.row_factory = sqlite3.Row
-            conn.execute("SELECT 1")
-            return conn
-        except sqlite3.DatabaseError:
-            if conn is not None:
-                conn.close()
-                conn = None
-            continue
-    raise sqlite3.OperationalError(f"Could not open Mela database read-only: {path}")
+    try:
+        conn = sqlite3.connect(snapshot.as_uri() + "?mode=ro", uri=True,
+                               timeout=2, factory=Connection)
+        conn.snapshot_directory = directory
+        conn.source_path = source
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("PRAGMA trusted_schema=OFF")
+        conn.create_function("mela_contains", 2,
+                             lambda value, term: int(term.casefold() in str(value or "").casefold()),
+                             deterministic=True)
+        conn.create_collation("MELA_CASEFOLD", lambda a, b:
+                              (a.casefold() > b.casefold()) - (a.casefold() < b.casefold()))
+        conn.set_authorizer(_authorize)
+        conn.execute("BEGIN")
+        conn.schema = inspect_schema(conn)
+        return conn
+    except BaseException:
+        if conn is not None:
+            conn.close()
+        else:
+            directory.cleanup()
+        raise
 
-def list_tags(conn: sqlite3.Connection) -> list[dict]:
-    rows = conn.execute(
-        """
-        SELECT t.ZTITLE AS tag, COUNT(j.Z_4RECIPES) AS count
-        FROM ZRECIPETAG t
-        LEFT JOIN Z_4TAGS j ON j.Z_5TAGS = t.Z_PK
-        WHERE t.ZTITLE IS NOT NULL AND t.ZTITLE != ''
-        GROUP BY t.Z_PK
-        ORDER BY count DESC, tag ASC
-        """
-    ).fetchall()
-    return [{"tag": r["tag"], "count": r["count"]} for r in rows]
 
-from datetime import datetime, timezone
+def _schema(conn: Connection) -> Schema:
+    conn.schema.require_valid()
+    return conn.schema
 
-_CD_EPOCH = 978307200  # seconds between 1970-01-01 and 2001-01-01 UTC
 
 def _coredata_ts_to_iso(ts):
     if ts is None:
         return None
-    return datetime.fromtimestamp(ts + _CD_EPOCH, tz=timezone.utc).isoformat()
+    try:
+        value = float(ts)
+        if not math.isfinite(value):
+            raise ValueError("non-finite date")
+        return datetime.fromtimestamp(value + 978307200, tz=timezone.utc).isoformat()
+    except (ValueError, TypeError, OverflowError, OSError) as exc:
+        raise MelaError("data_invalid", "Recipe date is not a supported Core Data timestamp.") from exc
 
-def _tags_for(conn: sqlite3.Connection, pk: int) -> list[str]:
+
+def _recipe_fields(row: sqlite3.Row, schema: Schema, fields: list[str]) -> dict:
+    result = {key: row[FIELDS[key]] if FIELDS[key] in schema.tables["ZRECIPEOBJECT"] else None
+              for key in fields}
+    if not isinstance(result.get("id"), int) or result["id"] <= 0:
+        raise MelaError("data_invalid", "Recipe primary key is not a positive integer.")
+    for key, value in result.items():
+        if key not in {"id", "favorite", "want_to_cook", "date_added"} and value is not None and not isinstance(value, str):
+            raise MelaError("data_invalid", f"Recipe {key} is not text as expected by the inspected schema.")
+    for key in ("favorite", "want_to_cook"):
+        if key in result:
+            if result[key] not in (0, 1, None):
+                raise MelaError("data_invalid", f"Recipe {key} flag is not 0, 1, or NULL.")
+            result[key] = bool(result[key])
+    if "date_added" in result:
+        result["date_added"] = _coredata_ts_to_iso(result["date_added"])
+    return result
+
+
+def _tags_batch(conn: Connection, ids: list[int]) -> dict[int, list[str]]:
+    result = {pk: [] for pk in ids}
+    if not ids:
+        return result
+    s = _schema(conn)
+    join, recipe, tag = map(quote_identifier, (s.join_table, s.recipe_column, s.tag_column))
+    marks = ",".join("?" for _ in ids)
     rows = conn.execute(
-        """
-        SELECT t.ZTITLE AS tag FROM ZRECIPETAG t
-        JOIN Z_4TAGS j ON j.Z_5TAGS = t.Z_PK
-        WHERE j.Z_4RECIPES = ? AND t.ZTITLE IS NOT NULL AND t.ZTITLE != ''
-        ORDER BY t.ZTITLE ASC
-        """,
-        (pk,),
-    ).fetchall()
-    return [r["tag"] for r in rows]
+        f"SELECT DISTINCT j.{recipe} AS id, t.ZTITLE AS tag FROM {join} j "
+        f"JOIN ZRECIPETAG t ON t.Z_PK=j.{tag} WHERE j.{recipe} IN ({marks}) "
+        "AND t.ZTITLE IS NOT NULL AND t.ZTITLE!='' "
+        "ORDER BY t.ZTITLE COLLATE MELA_CASEFOLD, t.ZTITLE", ids)
+    for row in rows:
+        if not isinstance(row["tag"], str):
+            raise MelaError("data_invalid", "Tag title is not text as expected by the inspected schema.")
+        result[row["id"]].append(row["tag"])
+    return result
 
-def get_recipe(conn: sqlite3.Connection, pk: int) -> dict | None:
-    row = conn.execute(
-        "SELECT * FROM ZRECIPEOBJECT WHERE Z_PK = ?", (pk,)
-    ).fetchone()
-    if row is None:
-        return None
-    return {
-        "id": row["Z_PK"],
-        "uuid": row["ZID"],
-        "title": row["ZTITLE"],
-        "ingredients": row["ZINGREDIENTS"],
-        "instructions": row["ZINSTRUCTIONS"],
-        "notes": row["ZNOTES"],
-        "description": row["ZTEXT"],
-        "nutrition": row["ZNUTRITION"],
-        "link": row["ZLINK"],
-        "prep_time": row["ZPREPTIME"],
-        "cook_time": row["ZCOOKTIME"],
-        "total_time": row["ZTOTALTIME"],
-        "yield": row["ZYIELD"],
-        "favorite": bool(row["ZFAVORITE"]),
-        "want_to_cook": bool(row["ZWANTTOCOOK"]),
-        "date_added": _coredata_ts_to_iso(row["ZDATE"]),
-        "tags": _tags_for(conn, pk),
-        "image_count": image_count(conn, pk),
-    }
 
-def image_count(conn: sqlite3.Connection, pk: int) -> int:
-    row = conn.execute(
-        "SELECT COUNT(*) AS n FROM ZRECIPEIMAGEOBJECT WHERE ZRECIPE = ?", (pk,)
-    ).fetchone()
-    return row["n"] if row else 0
-
-def get_recipe_image_bytes(conn: sqlite3.Connection, db_path: str, pk: int,
-                           index: int = 0) -> bytes | None:
-    """Return raw (pre-conversion) image bytes for a recipe's image at `index`
-    (0-based, ordered by ZINDEX), or None if unavailable."""
-    if index < 0:
-        return None
+def list_tags(conn: Connection) -> list[dict]:
+    s = _schema(conn)
+    join, recipe, tag = map(quote_identifier, (s.join_table, s.recipe_column, s.tag_column))
     rows = conn.execute(
-        "SELECT ZDATA FROM ZRECIPEIMAGEOBJECT WHERE ZRECIPE = ? "
-        "ORDER BY ZINDEX ASC, Z_PK ASC",
-        (pk,),
-    ).fetchall()
-    if index >= len(rows):
+        f"SELECT t.ZTITLE AS tag, COUNT(DISTINCT r.Z_PK) AS count FROM ZRECIPETAG t "
+        f"LEFT JOIN {join} j ON j.{tag}=t.Z_PK "
+        f"LEFT JOIN ZRECIPEOBJECT r ON r.Z_PK=j.{recipe} "
+        "WHERE t.ZTITLE IS NOT NULL AND t.ZTITLE!='' GROUP BY t.ZTITLE "
+        "ORDER BY count DESC, tag COLLATE MELA_CASEFOLD, tag")
+    result = [dict(row) for row in rows]
+    if any(not isinstance(row["tag"], str) for row in result):
+        raise MelaError("data_invalid", "Tag title is not text as expected by the inspected schema.")
+    return result
+
+
+def image_count(conn: Connection, pk: int) -> int | None:
+    if not _schema(conn).images:
         return None
-    blob = rows[index]["ZDATA"]
-    if not blob:
+    return conn.execute("SELECT COUNT(*) FROM ZRECIPEIMAGEOBJECT WHERE ZRECIPE=?", (pk,)).fetchone()[0]
+
+
+def get_recipe(conn: Connection, pk: int | str) -> dict | None:
+    """Numeric values select local PK; strings select exact ZID. Never guess."""
+    s = _schema(conn)
+    if isinstance(pk, bool) or not isinstance(pk, (int, str)) or (isinstance(pk, int) and pk <= 0) or pk == "":
+        raise MelaError("invalid_argument", "recipe_id must be a positive integer PK or a nonempty exact ZID string.")
+    column = "Z_PK" if isinstance(pk, int) else "ZID"
+    rows = conn.execute(f"SELECT * FROM ZRECIPEOBJECT WHERE {column}=? ORDER BY Z_PK LIMIT 2", (pk,)).fetchall()
+    if len(rows) > 1:
+        raise MelaError("recipe_ambiguous", "Multiple recipes have that ZID; use a numeric id.", recipe_id=pk)
+    if not rows:
         return None
-    prefix = blob[0]
-    if prefix == 1:
-        if len(blob) <= 1:
-            return None
-        return bytes(blob[1:])
-    if prefix == 2:
-        uuid = bytes(blob[1:37]).decode("ascii", "ignore")
-        if not _UUID_RE.match(uuid):
-            return None
-        path = os.path.join(
-            os.path.dirname(db_path), ".Curcuma_SUPPORT", "_EXTERNAL_DATA", uuid
-        )
-        try:
-            if os.path.getsize(path) > MAX_IMAGE_BYTES:
-                return None
-            with open(path, "rb") as f:
-                return f.read()
-        except OSError:
-            return None
-    return None
+    result = _recipe_fields(rows[0], s, list(FIELDS))
+    result["tags"] = _tags_batch(conn, [result["id"]])[result["id"]]
+    result["image_count"] = image_count(conn, result["id"])
+    return result
 
-_SEARCH_COLS = (
-    "ZTITLE", "ZINGREDIENTS", "ZINSTRUCTIONS",
-    "ZNOTES", "ZTEXT", "ZNUTRITION", "ZLINK",
-)
 
-def _snippet(text: str, term: str, width: int = 120) -> str:
-    lo = text.lower().find(term.lower())
-    if lo < 0:
-        return text[:width].strip()
-    start = max(0, lo - width // 2)
-    end = min(len(text), start + width)
-    piece = text[start:end].strip()
-    return ("…" if start > 0 else "") + piece + ("…" if end < len(text) else "")
+def _validate_page(limit: int, offset: int) -> None:
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_PAGE_SIZE:
+        raise MelaError("invalid_argument", f"limit must be an integer from 1 to {MAX_PAGE_SIZE}.")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise MelaError("invalid_argument", "offset must be a nonnegative integer.")
 
-def search_recipes(conn, query, tag=None, favorite=None,
-                   want_to_cook=None, limit=20):
+
+def recipe_page(conn: Connection, query: str = "", tag: str | None = None,
+                favorite: bool | None = None, want_to_cook: bool | None = None,
+                limit: int = 20, offset: int = 0, *, snippets: bool = False) -> dict:
+    _validate_page(limit, offset)
+    s = _schema(conn)
+    if not isinstance(query, str) or len(query) > 2000 or len(query.split()) > 32:
+        raise MelaError("invalid_argument", "query must be text, at most 2000 characters and 32 words.")
+    if tag is not None and not isinstance(tag, str):
+        raise MelaError("invalid_argument", "tag must be an exact tag name or null.")
+    for name, value in (("favorite", favorite), ("want_to_cook", want_to_cook)):
+        if value is not None and not isinstance(value, bool):
+            raise MelaError("invalid_argument", f"{name} must be true, false, or null.")
     terms = query.split()
     where, params = [], []
     for term in terms:
-        ors = " OR ".join(f"r.{c} LIKE ? ESCAPE '\\'" for c in _SEARCH_COLS)
-        where.append(f"({ors})")
-        like = "%" + term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
-        params.extend([like] * len(_SEARCH_COLS))
-    if favorite is not None:
-        where.append("r.ZFAVORITE = ?")
-        params.append(1 if favorite else 0)
-    if want_to_cook is not None:
-        where.append("r.ZWANTTOCOOK = ?")
-        params.append(1 if want_to_cook else 0)
-    if tag:
-        where.append(
-            "EXISTS (SELECT 1 FROM Z_4TAGS j JOIN ZRECIPETAG t "
-            "ON t.Z_PK = j.Z_5TAGS WHERE j.Z_4RECIPES = r.Z_PK AND t.ZTITLE = ?)"
-        )
+        where.append("(" + " OR ".join(f"mela_contains(r.{FIELDS[c]}, ?)" for c in SEARCH_FIELDS) + ")")
+        params.extend([term] * len(SEARCH_FIELDS))
+    for key, value in (("favorite", favorite), ("want_to_cook", want_to_cook)):
+        if value is not None:
+            where.append(f"COALESCE(r.{FIELDS[key]},0)=?")
+            params.append(int(value))
+    if tag is not None:
+        join, recipe, tag_col = map(quote_identifier, (s.join_table, s.recipe_column, s.tag_column))
+        where.append(f"EXISTS (SELECT 1 FROM {join} j JOIN ZRECIPETAG t ON t.Z_PK=j.{tag_col} "
+                     f"WHERE j.{recipe}=r.Z_PK AND t.ZTITLE=?)")
         params.append(tag)
     clause = " AND ".join(where) if where else "1"
-    params.append(limit)
-    rows = conn.execute(
-        f"SELECT r.Z_PK AS id, r.ZTITLE AS title FROM ZRECIPEOBJECT r "
-        f"WHERE {clause} ORDER BY r.ZTITLE ASC LIMIT ?",
-        params,
-    ).fetchall()
+    total = conn.execute(f"SELECT COUNT(*) FROM ZRECIPEOBJECT r WHERE {clause}", params).fetchone()[0]
+    fields = ["id", "uuid", "title", "favorite", "want_to_cook", "prep_time", "cook_time", "total_time", "yield"]
+    selected = list(dict.fromkeys([FIELDS[c] for c in fields] + ([FIELDS[c] for c in SEARCH_FIELDS] if snippets else [])))
+    rows = conn.execute("SELECT " + ", ".join("r." + c for c in selected) +
+                        f" FROM ZRECIPEOBJECT r WHERE {clause} "
+                        "ORDER BY r.ZTITLE COLLATE MELA_CASEFOLD, r.ZTITLE, r.Z_PK LIMIT ? OFFSET ?",
+                        params + [limit, offset]).fetchall()
+    tags = _tags_batch(conn, [r["Z_PK"] for r in rows])
     results = []
     for row in rows:
-        full = conn.execute(
-            "SELECT " + ", ".join(_SEARCH_COLS)
-            + " FROM ZRECIPEOBJECT WHERE Z_PK = ?",
-            (row["id"],),
-        ).fetchone()
-        blob = " ".join(str(full[c] or "") for c in _SEARCH_COLS)
-        snip = _snippet(blob, terms[0]) if terms else blob[:120]
-        results.append({
-            "id": row["id"], "title": row["title"],
-            "tags": _tags_for(conn, row["id"]), "snippet": snip,
-        })
-    return results
+        result = _recipe_fields(row, s, fields)
+        result["tags"] = tags[result["id"]]
+        if snippets:
+            text = " ".join(str(row[FIELDS[c]] or "") for c in SEARCH_FIELDS)
+            result["snippet"] = text[:120]  # Bounded preview; full raw text is in get_recipe.
+        results.append(result)
+    next_offset = offset + len(results)
+    return {"recipes": results, "total": total, "limit": limit, "offset": offset,
+            "next_offset": next_offset if next_offset < total else None,
+            "schema_warnings": s.warnings}
+
+
+def search_recipes(conn, query, tag=None, favorite=None, want_to_cook=None, limit=20, offset=0):
+    """Compatibility helper; the MCP uses recipe_page for paging metadata."""
+    return recipe_page(conn, query, tag, favorite, want_to_cook, limit, offset, snippets=True)["recipes"]
+
+
+def get_recipe_image_bytes(conn: Connection, db_path: str, pk: int, index: int = 0) -> bytes | None:
+    """Optional image helper; never called by recipe MCP tools."""
+    if index < 0 or not _schema(conn).images:
+        return None
+    row = conn.execute("SELECT ZDATA FROM ZRECIPEIMAGEOBJECT WHERE ZRECIPE=? "
+                       "ORDER BY ZINDEX, Z_PK LIMIT 1 OFFSET ?", (pk, index)).fetchone()
+    if row is None:
+        return None
+    from .images import decode_image
+    import os
+    support = os.environ.get("MELA_SUPPORT_DIR") or str(Path(db_path).parent / ".Curcuma_SUPPORT/_EXTERNAL_DATA")
+    try:
+        return decode_image(row[0], Path(support).expanduser(), max_bytes=MAX_IMAGE_BYTES)
+    except MelaError:
+        return None  # Optional legacy helper; detailed decoder exceptions remain available.
